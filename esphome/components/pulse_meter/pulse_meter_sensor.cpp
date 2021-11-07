@@ -7,48 +7,60 @@ namespace pulse_meter {
 static const char *const TAG = "pulse_meter";
 
 void PulseMeterSensor::setup() {
+  this->pulse_q_ = xQueueCreate(10, sizeof(pulse_data_t *));
   this->pin_->setup();
   this->isr_pin_ = pin_->to_isr();
   this->pin_->attach_interrupt(PulseMeterSensor::gpio_intr, this, gpio::INTERRUPT_ANY_EDGE);
 
-  this->last_detected_edge_us_ = 0;
-  this->last_valid_edge_us_ = 0;
 }
 
 void PulseMeterSensor::loop() {
-  const uint32_t now = micros();
+    const uint32_t now = micros();
 
-  // Dont run this function if Interrupt is in progress
-  if (this->busy_ > 0)
-    return;
+    uint32_t pulse_width;
+    pulse_data_t *pdata;
+    if (xQueueReceive(this->pulse_q_, &pdata, 1L) == pdTRUE)
+    {
+     //ESP_LOGD(TAG, "Got pulse at %us",pdata->ts_value);
 
-  // If we've exceeded our timeout interval without receiving any pulses, assume 0 pulses/min until
-  // we get at least two valid pulses.
-  const uint32_t time_since_valid_edge_us = now - this->last_valid_edge_us_;
-  if ((this->last_valid_edge_us_ != 0) && (time_since_valid_edge_us > this->timeout_us_)) {
-    ESP_LOGD(TAG, "No pulse detected for %us, assuming 0 pulses/min", time_since_valid_edge_us / 1000000);
-    this->last_valid_edge_us_ = 0;
-    this->pulse_width_us_ = 0;
-  }
+     if (last_pulse != 0)
+      {
+         pulse_width = pdata->ts_value-last_pulse;
+         if (pulse_width > this->filter_us_) 
+           {
+           ESP_LOGD(TAG, "A: Pulses/Min %f",(60.0 * 1000.0) / (pulse_width / 1000));
+           const uint32_t pulse_width_ms = pulse_width / 1000;
+           if (this->pulse_width_dedupe_.next(pulse_width_ms)) {
+             // Calculate pulses/min from the pulse width in ms
+             this->publish_state((60.0 * 1000.0) / pulse_width_ms);
+           }
+  
 
-  // We quantize our pulse widths to 1 ms to avoid unnecessary jitter
-  const uint32_t pulse_width_ms = this->pulse_width_us_ / 1000;
-  if (this->pulse_width_dedupe_.next(pulse_width_ms)) {
-    if (pulse_width_ms == 0) {
-      // Treat 0 pulse width as 0 pulses/min (normally because we've not detected any pulses for a while)
-      this->publish_state(0);
-    } else {
-      // Calculate pulses/min from the pulse width in ms
-      this->publish_state((60.0 * 1000.0) / pulse_width_ms);
+           this->last_pulse = pdata->ts_value;
+           this->total_pulses_++;
+           const uint32_t total = this->total_pulses_;
+           if (this->total_dedupe_.next(total)) {
+             this->total_sensor_->publish_state(total);
+           }
+         }
+      } else
+      {
+        this->last_pulse = pdata->ts_value;
+      }
+     delete pdata;
+    } else
+    {
+    if (this->last_pulse != 0)
+     {
+      const uint32_t time_since_valid_edge_us = now - this->last_pulse;
+      if  (time_since_valid_edge_us > this->timeout_us_) {
+        ESP_LOGD(TAG, "No pulse detected for %us, assuming 0 pulses/min", time_since_valid_edge_us / 1000000);
+        this->last_pulse=0;
+        this->publish_state(0);
+       }
+     }
     }
-  }
-
-  if (this->total_sensor_ != nullptr) {
-    const uint32_t total = this->total_pulses_;
-    if (this->total_dedupe_.next(total)) {
-      this->total_sensor_->publish_state(total);
-    }
-  }
+  return;
 }
 
 void PulseMeterSensor::set_total_pulses(uint32_t pulses) { this->total_pulses_ = pulses; }
@@ -62,30 +74,23 @@ void PulseMeterSensor::dump_config() {
 
 void IRAM_ATTR PulseMeterSensor::gpio_intr(PulseMeterSensor *sensor) {
   // This is an interrupt handler - we can't call any virtual method from this method
-  sensor->busy_ = 1;
 
   // Get the current time before we do anything else so the measurements are consistent
   const uint32_t now = micros();
 
   // We only look at rising edges
   if (!sensor->isr_pin_.digital_read()) {
-    sensor->busy_ = 0;
     return;
   }
 
-  // Check to see if we should filter this edge out
-  if ((now - sensor->last_detected_edge_us_) >= sensor->filter_us_) {
-    // Don't measure the first valid pulse (we need at least two pulses to measure the width)
-    if (sensor->last_valid_edge_us_ != 0) {
-      sensor->pulse_width_us_ = (now - sensor->last_valid_edge_us_);
-    }
-
-    sensor->total_pulses_++;
-    sensor->last_valid_edge_us_ = now;
-  }
-
-  sensor->last_detected_edge_us_ = now;
-  sensor->busy_ = 0;
+  if ((now - sensor->last_irq)/1000 > 100) // 100mSec lockout
+   { 
+     auto *pdata = new pulse_data_t;
+     pdata->ts_value = now;
+     xQueueSendFromISR(sensor->pulse_q_, &pdata, NULL);
+   }
+   
+  sensor->last_irq = now;
 }
 
 }  // namespace pulse_meter

@@ -5,8 +5,16 @@
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/core/helpers.h"
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+
+
 namespace esphome {
 namespace pulse_meter {
+
+struct pulse_data_t {
+   uint32_t ts_value;
+};
 
 class PulseMeterSensor : public sensor::Sensor, public Component {
  public:
@@ -34,11 +42,10 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
   Deduplicator<uint32_t> pulse_width_dedupe_;
   Deduplicator<uint32_t> total_dedupe_;
 
-  volatile uint32_t last_detected_edge_us_ = 0;
-  volatile uint32_t last_valid_edge_us_ = 0;
-  volatile uint32_t pulse_width_us_ = 0;
   volatile uint32_t total_pulses_ = 0;
-  volatile uint32_t busy_ = 0;
+  QueueHandle_t pulse_q_;
+  volatile uint32_t last_irq = 0;
+  volatile uint32_t last_pulse;
 };
 
 }  // namespace pulse_meter
